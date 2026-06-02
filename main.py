@@ -1,48 +1,78 @@
 """
-API de Tendências Musicais e Engajamento
------------------------------------------
-Algoritmo para deteção de hype de artistas e sugestão de estratégias.
+API de Tendências Musicais e Engajamento — DADOS REAIS
+------------------------------------------------------
+Fontes de dados reais:
+  * YouTube Data API v3 -> views, likes, comentários e recência por vídeo
+  * Last.fm API         -> ouvintes e reproduções totais por artista (popularidade)
 
-Versão revista:
-  - Correção da regra "Nostalgia/TBT" (antes era código morto).
-  - Robustez na divisão (impede horas negativas -> inf/NaN no JSON).
-  - Serialização portável entre versões do pandas (cast de escalares NumPy).
-  - Limiares centralizados em constantes nomeadas.
-  - Nomes de campos ASCII e estáveis no contrato da API.
-  - Lógica separada em funções testáveis isoladamente.
+O Hype Score combina engajamento RECENTE (YouTube, com decaimento temporal)
+modulado pela popularidade GLOBAL do artista (Last.fm).
+
+Requer duas variáveis de ambiente (definir no painel do Render -> Environment):
+  YOUTUBE_API_KEY -> Google Cloud Console (ativar "YouTube Data API v3")
+  LASTFM_API_KEY  -> https://www.last.fm/api/account/create
 """
 
+import logging
 import math
+import os
+import time
+from datetime import datetime, timezone
 from typing import List
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI
+import requests
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+logger = logging.getLogger("tendencias")
+
 # ---------------------------------------------------------------------------
-# Parâmetros do modelo (centralizados para facilitar a afinação)
+# Configuração
 # ---------------------------------------------------------------------------
 
-# Pesos de engajamento
-PESO_MENCAO = 1.0
-PESO_COMPARTILHAR = 3.5
-PESO_SALVAR = 4.0
+ARTISTAS = ["CATWEN", "Dua Lipa", "Zara Larsson"]
+
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY")
+
+YOUTUBE_BASE = "https://www.googleapis.com/youtube/v3"
+LASTFM_BASE = "https://ws.audioscrobbler.com/2.0/"
+
+MAX_VIDEOS_POR_ARTISTA = 3
+HTTP_TIMEOUT = 10  # segundos
+
+# Pesos de engajamento (YouTube). Likes e comentários valem mais que views
+# porque exigem mais intenção do utilizador.
+PESO_VIEW = 1.0
+PESO_LIKE = 5.0
+PESO_COMENTARIO = 10.0
 
 # Decaimento temporal exponencial aplicado ao Trend Score
 FATOR_DECAIMENTO = 1.7
 
-# Limiares das regras de estratégia (ajustar conforme o comportamento real)
-LIMIAR_ULTRA_HYPE_SCORE = 5000      # Hype mínimo para "Ultra Hype"
-LIMIAR_ULTRA_HYPE_IDADE = 6         # Idade máxima (h) para conteúdo "fresco"
-LIMIAR_GUERRA_MENCOES = 2000        # Menções mínimas para disputa de fandoms
-LIMIAR_SALVAR = 1500                # Salves mínimos para CTA de salvamento
-LIMIAR_NOSTALGIA_IDADE = 24         # Idade mínima (h) para considerar "TBT"
-LIMIAR_NOSTALGIA_MENCOES = 1500     # Engajamento absoluto mínimo p/ nostalgia
+# Peso da popularidade da Last.fm na modulação do Hype Score (escala log, para
+# que números enormes de ouvintes não esmaguem por completo o sinal recente).
+PESO_LASTFM_POP = 0.15
+
+# Limiares das regras de estratégia.
+# IMPORTANTE: com dados reais as ordens de grandeza mudam muito (views podem ir
+# aos milhões). Estes valores são PONTOS DE PARTIDA — calibra-os depois de veres
+# os números reais que o /tendencias devolve.
+LIMIAR_FRESCO_HORAS = 72            # "fresco" = média de idade <= 3 dias
+LIMIAR_NOSTALGIA_IDADE = 24 * 30    # conteúdo já com >= ~30 dias
+LIMIAR_NOSTALGIA_OUVINTES = 500_000  # artista globalmente popular (Last.fm)
+LIMIAR_CTA_LIKES = 50_000           # total de likes para CTA de salvamento
+
+# Cache em memória: a search.list custa 100 unidades de quota; sem cache
+# esgotarias as 10.000/dia em poucas dezenas de pedidos.
+CACHE_TTL_SEGUNDOS = 15 * 60
+_cache = {"timestamp": 0.0, "dados": None}
 
 app = FastAPI(
     title="API de Tendências Musicais e Engajamento",
-    description="Algoritmo avançado para deteção de hype de artistas e automação de estratégias.",
+    description="Hype de artistas a partir de dados reais do YouTube e da Last.fm.",
 )
 
 
@@ -52,140 +82,191 @@ app = FastAPI(
 
 class TendenciaArtista(BaseModel):
     Artista: str
-    Volume_Total_Mencoes: int
-    Total_Salves: int
+    Total_Views: int
+    Total_Likes: int
+    Total_Comentarios: int
+    LastFm_Ouvintes: int
+    LastFm_Plays: int
     Hype_Score: float
     Idade_Media_Horas: float
     Acao_Sugerida: str
 
 
 # ---------------------------------------------------------------------------
-# Funções de domínio (separadas para serem testáveis isoladamente)
+# Acesso às APIs externas (isolado para ser fácil de testar/substituir)
 # ---------------------------------------------------------------------------
 
-# Colunas obrigatórias em cada registo (usado para validação)
-COLUNAS_OBRIGATORIAS = [
-    "Artista", "Faixa_ou_Assunto", "Mencoes",
-    "Compartilhamentos", "Salves_Favoritos", "Horas_Desde_Lancamento",
-]
+def _http_get_json(url: str, params: dict) -> dict:
+    resp = requests.get(url, params=params, timeout=HTTP_TIMEOUT)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def carregar_dados() -> pd.DataFrame:
-    """Fonte de dados (simulada). Substituir pela ingestão real das APIs das redes.
+def _horas_desde(iso_timestamp: str) -> float:
+    """Converte um timestamp ISO 8601 (ex.: '2026-05-30T12:00:00Z') em horas decorridas."""
+    publicado = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    delta = datetime.now(timezone.utc) - publicado
+    return max(delta.total_seconds() / 3600.0, 0.0)
 
-    Estrutura como UMA LISTA COM UM DICIONÁRIO POR FAIXA. Cada registo é
-    autocontido, por isso é impossível "desalinhar colunas" (era o que
-    provocava o erro 'All arrays must be of the same length'): para adicionar
-    ou remover uma faixa, mexe-se num bloco só.
-    """
-    dados_musica = [
-        {"Artista": "CATWEN",       "Faixa_ou_Assunto": "Single de Estreia",     "Mencoes": 4500, "Compartilhamentos": 3800, "Salves_Favoritos": 2900, "Horas_Desde_Lancamento": 2},
-        {"Artista": "CATWEN",       "Faixa_ou_Assunto": "Performance Viral",     "Mencoes": 3200, "Compartilhamentos": 2600, "Salves_Favoritos": 1800, "Horas_Desde_Lancamento": 4},
-        {"Artista": "Dua Lipa",     "Faixa_ou_Assunto": "Novo Single",           "Mencoes": 3000, "Compartilhamentos": 2000, "Salves_Favoritos": 1500, "Horas_Desde_Lancamento": 6},
-        {"Artista": "Dua Lipa",     "Faixa_ou_Assunto": "Remix Internacional",   "Mencoes": 1200, "Compartilhamentos": 500,  "Salves_Favoritos": 400,  "Horas_Desde_Lancamento": 18},
-        {"Artista": "Zara Larsson", "Faixa_ou_Assunto": "Faixa de Catálogo",     "Mencoes": 900,  "Compartilhamentos": 400,  "Salves_Favoritos": 300,  "Horas_Desde_Lancamento": 30},
-        {"Artista": "Zara Larsson", "Faixa_ou_Assunto": "Resgate de Hit Antigo", "Mencoes": 800,  "Compartilhamentos": 200,  "Salves_Favoritos": 250,  "Horas_Desde_Lancamento": 36},
+
+def buscar_videos_youtube(artista: str) -> List[dict]:
+    """Procura os vídeos mais recentes do artista e devolve estatísticas reais."""
+    # 1) search.list -> obter IDs de vídeos (custa 100 unidades de quota)
+    busca = _http_get_json(
+        f"{YOUTUBE_BASE}/search",
+        {
+            "key": YOUTUBE_API_KEY,
+            "q": artista,
+            "part": "id",
+            "type": "video",
+            "order": "date",
+            "maxResults": MAX_VIDEOS_POR_ARTISTA,
+        },
+    )
+    ids = [
+        item["id"]["videoId"]
+        for item in busca.get("items", [])
+        if item.get("id", {}).get("videoId")
     ]
+    if not ids:
+        return []
 
-    df = pd.DataFrame(dados_musica)
+    # 2) videos.list -> estatísticas reais (custa apenas 1 unidade)
+    detalhes = _http_get_json(
+        f"{YOUTUBE_BASE}/videos",
+        {"key": YOUTUBE_API_KEY, "id": ",".join(ids), "part": "snippet,statistics"},
+    )
 
-    # Validação defensiva: se algum registo não trouxer todas as colunas,
-    # falha com uma mensagem clara em vez de um erro críptico do pandas.
-    em_falta = [c for c in COLUNAS_OBRIGATORIAS if c not in df.columns]
-    if em_falta:
-        raise ValueError(f"Faltam colunas nos dados: {em_falta}")
+    linhas = []
+    for item in detalhes.get("items", []):
+        stats = item.get("statistics", {})
+        snippet = item.get("snippet", {})
+        linhas.append(
+            {
+                "Artista": artista,
+                "Faixa_ou_Assunto": snippet.get("title", "(sem título)"),
+                "Views": int(stats.get("viewCount", 0)),
+                # likeCount pode vir ausente se o criador esconder os gostos
+                "Likes": int(stats.get("likeCount", 0)),
+                "Comentarios": int(stats.get("commentCount", 0)),
+                "Horas_Desde_Publicacao": _horas_desde(snippet["publishedAt"]),
+            }
+        )
+    return linhas
 
-    return df
 
+def buscar_popularidade_lastfm(artista: str) -> dict:
+    """Devolve ouvintes e reproduções totais do artista (Last.fm)."""
+    dados = _http_get_json(
+        LASTFM_BASE,
+        {
+            "method": "artist.getInfo",
+            "artist": artista,
+            "api_key": LASTFM_API_KEY,
+            "format": "json",
+            "autocorrect": 1,
+        },
+    )
+    stats = dados.get("artist", {}).get("stats", {})
+    return {
+        "LastFm_Ouvintes": int(stats.get("listeners", 0)),
+        "LastFm_Plays": int(stats.get("playcount", 0)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Lógica de domínio (testável sem rede)
+# ---------------------------------------------------------------------------
 
 def truncar_score(valor: float, casas_decimais: int = 2) -> float:
-    """Trunca (não arredonda) para evitar que limites numéricos falhem por arredondamento."""
     fator = 10 ** casas_decimais
     return math.floor(valor * fator) / fator
 
 
-def calcular_ranking(df: pd.DataFrame) -> pd.DataFrame:
-    """Calcula engajamento ponderado, trend score com decaimento e consolida por artista."""
-    df = df.copy()
+def calcular_ranking(videos: List[dict], popularidade: dict) -> pd.DataFrame:
+    """Combina engajamento recente (YouTube) com popularidade total (Last.fm)."""
+    if not videos:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(videos)
 
     df["Engajamento_Ponderado"] = (
-        df["Mencoes"] * PESO_MENCAO
-        + df["Compartilhamentos"] * PESO_COMPARTILHAR
-        + df["Salves_Favoritos"] * PESO_SALVAR
+        df["Views"] * PESO_VIEW
+        + df["Likes"] * PESO_LIKE
+        + df["Comentarios"] * PESO_COMENTARIO
     )
-
-    # Robustez: nunca permitir horas negativas (dados das APIs podem vir
-    # dessincronizados / com fuso errado). Sem isto, uma hora == -1 daria
-    # divisão por zero -> inf -> JSON inválido.
-    horas = df["Horas_Desde_Lancamento"].clip(lower=0)
+    horas = df["Horas_Desde_Publicacao"].clip(lower=0)
     df["Trend_Score"] = df["Engajamento_Ponderado"] / (horas + 1) ** FATOR_DECAIMENTO
 
-    # Nota de design: somamos o Trend_Score por artista (mede presença total
-    # no momento). Para medir apenas "a faixa mais quente agora", trocar
-    # 'sum' por 'max' na agregação de Hype_Score.
     ranking = (
         df.groupby("Artista")
         .agg(
-            Volume_Total_Mencoes=("Mencoes", "sum"),
-            Total_Salves=("Salves_Favoritos", "sum"),
-            Hype_Score=("Trend_Score", "sum"),
-            Idade_Media_Horas=("Horas_Desde_Lancamento", "mean"),
+            Total_Views=("Views", "sum"),
+            Total_Likes=("Likes", "sum"),
+            Total_Comentarios=("Comentarios", "sum"),
+            Trend_Score_Base=("Trend_Score", "sum"),
+            Idade_Media_Horas=("Horas_Desde_Publicacao", "mean"),
         )
-        .sort_values(by="Hype_Score", ascending=False)
         .reset_index()
     )
 
-    ranking["Hype_Score"] = ranking["Hype_Score"].apply(lambda x: truncar_score(x, 2))
+    # Anexar popularidade da Last.fm
+    ranking["LastFm_Ouvintes"] = ranking["Artista"].map(
+        lambda a: popularidade.get(a, {}).get("LastFm_Ouvintes", 0)
+    )
+    ranking["LastFm_Plays"] = ranking["Artista"].map(
+        lambda a: popularidade.get(a, {}).get("LastFm_Plays", 0)
+    )
+
+    # Modular o sinal recente do YouTube pela popularidade global da Last.fm
+    fator_pop = 1 + PESO_LASTFM_POP * np.log10(ranking["LastFm_Ouvintes"].clip(lower=0) + 1)
+    ranking["Hype_Score"] = (ranking["Trend_Score_Base"] * fator_pop).apply(
+        lambda x: truncar_score(x, 2)
+    )
+
+    ranking = ranking.sort_values(by="Hype_Score", ascending=False).reset_index(drop=True)
+    ranking["Idade_Media_Horas"] = ranking["Idade_Media_Horas"].round(1)
     return ranking
 
 
 def gerar_estrategias(ranking: pd.DataFrame) -> pd.DataFrame:
-    """Anexa a coluna 'Acao_Sugerida' com base nas regras de negócio."""
+    """Anexa a coluna 'Acao_Sugerida' usando posição no ranking + sinais das duas fontes."""
+    if ranking.empty:
+        return ranking
     ranking = ranking.copy()
-    top_2_artistas = ranking["Artista"].head(2).tolist()
 
-    def gerar_estrategia_engajamento(row) -> str:
+    def estrategia(posicao: int, row) -> str:
         acoes = []
 
-        # Ultra Hype: score muito alto em conteúdo fresco
-        if (
-            row["Hype_Score"] > LIMIAR_ULTRA_HYPE_SCORE
-            and row["Idade_Media_Horas"] <= LIMIAR_ULTRA_HYPE_IDADE
-        ):
+        # Ultra Hype: lidera o ranking e tem conteúdo fresco
+        if posicao == 0 and row["Idade_Media_Horas"] <= LIMIAR_FRESCO_HORAS:
             acoes.append(
                 "🔥 ULTRA HYPE: Crie Reels/Shorts com o áudio oficial AGORA. "
                 "O algoritmo das redes está a entregar organicamente."
             )
 
-        # Guerra de fandoms: entre os líderes e com volume relevante
-        if (
-            row["Artista"] in top_2_artistas
-            and row["Volume_Total_Mencoes"] > LIMIAR_GUERRA_MENCOES
-        ):
+        # Guerra de fandoms: entre os dois líderes do ranking
+        if posicao <= 1:
             acoes.append(
                 "⚔️ GUERRA DE FANDOMS: Crie uma enquete disputada no Instagram/X "
-                "comparando este artista com o outro líder do ranking para gerar "
-                "comentários em massa."
+                "comparando este artista com o outro líder do ranking."
             )
 
-        # CTA de salvamento
-        if row["Total_Salves"] > LIMIAR_SALVAR:
+        # CTA de salvamento: muito engajamento de likes (proxy de 'salvar')
+        if row["Total_Likes"] >= LIMIAR_CTA_LIKES:
             acoes.append(
-                "💾 CTA DE SALVAMENTO: Poste um carrossel informativo (ex.: tracklist, "
-                "datas) e termine com 'Salve este post para não esquecer!'."
+                "💾 CTA DE SALVAMENTO: Poste um carrossel informativo e termine com "
+                "'Salve este post para não esquecer!'."
             )
 
-        # Nostalgia / resgate de catálogo: conteúdo já ANTIGO mas que ainda tem
-        # engajamento ABSOLUTO elevado. Usamos o volume de menções (não decaído),
-        # porque o Trend_Score decai demasiado para detetar relevância duradoura
-        # — era por isso que a regra antiga (baseada em Hype_Score) nunca disparava.
+        # Nostalgia/TBT: conteúdo recente já antigo MAS artista globalmente popular
         if (
             row["Idade_Media_Horas"] >= LIMIAR_NOSTALGIA_IDADE
-            and row["Volume_Total_Mencoes"] >= LIMIAR_NOSTALGIA_MENCOES
+            and row["LastFm_Ouvintes"] >= LIMIAR_NOSTALGIA_OUVINTES
         ):
             acoes.append(
-                "⏳ NOSTALGIA/TBT: O assunto continua relevante mesmo após 24h. "
-                "Vale um post contextualizando a história ou conquistas do artista."
+                "⏳ NOSTALGIA/TBT: Sem lançamento recente, mas o artista mantém base "
+                "enorme. Vale um post de catálogo / efeméride."
             )
 
         if not acoes:
@@ -193,22 +274,47 @@ def gerar_estrategias(ranking: pd.DataFrame) -> pd.DataFrame:
 
         return " | ".join(acoes)
 
-    ranking["Acao_Sugerida"] = ranking.apply(gerar_estrategia_engajamento, axis=1)
+    ranking["Acao_Sugerida"] = [estrategia(i, row) for i, row in ranking.iterrows()]
     return ranking
 
 
 def para_tipos_nativos(ranking: pd.DataFrame) -> List[dict]:
-    """Converte escalares NumPy (np.int64/np.float64) em tipos nativos do Python.
-
-    Em versões antigas do pandas, to_dict devolve escalares NumPy, que o encoder
-    por omissão do FastAPI não consegue serializar (resulta em erro 500). Este
-    cast torna a resposta portável independentemente da versão do pandas.
-    """
+    """Converte escalares NumPy em tipos nativos do Python (serialização portável)."""
     registos = ranking.to_dict(orient="records")
     return [
         {k: (v.item() if isinstance(v, np.generic) else v) for k, v in registo.items()}
         for registo in registos
     ]
+
+
+def coletar_dados_reais() -> List[dict]:
+    if not YOUTUBE_API_KEY or not LASTFM_API_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Faltam YOUTUBE_API_KEY e/ou LASTFM_API_KEY nas variáveis de ambiente.",
+        )
+
+    videos: List[dict] = []
+    popularidade: dict = {}
+    for artista in ARTISTAS:
+        try:
+            videos.extend(buscar_videos_youtube(artista))
+        except Exception as exc:  # uma API falhar não deve derrubar o pedido todo
+            logger.warning("YouTube falhou para %s: %s", artista, exc)
+        try:
+            popularidade[artista] = buscar_popularidade_lastfm(artista)
+        except Exception as exc:
+            logger.warning("Last.fm falhou para %s: %s", artista, exc)
+
+    if not videos:
+        raise HTTPException(
+            status_code=502,
+            detail="Não foi possível obter dados do YouTube para nenhum artista.",
+        )
+
+    ranking = calcular_ranking(videos, popularidade)
+    ranking = gerar_estrategias(ranking)
+    return para_tipos_nativos(ranking)
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +325,21 @@ def para_tipos_nativos(ranking: pd.DataFrame) -> List[dict]:
 def home():
     return {
         "status": "Online",
-        "mensagem": "Algoritmo de Tendências Musicais a correr com todas as melhorias aplicadas.",
+        "mensagem": "Algoritmo de Tendências Musicais com dados reais (YouTube + Last.fm).",
     }
 
 
 @app.get("/tendencias", response_model=List[TendenciaArtista])
-def obter_tendencias():
-    df = carregar_dados()
-    ranking = calcular_ranking(df)
-    ranking = gerar_estrategias(ranking)
-    return para_tipos_nativos(ranking)
+def obter_tendencias(forcar_atualizacao: bool = False):
+    agora = time.time()
+    cache_valido = (
+        _cache["dados"] is not None
+        and (agora - _cache["timestamp"]) < CACHE_TTL_SEGUNDOS
+    )
+    if not forcar_atualizacao and cache_valido:
+        return _cache["dados"]
+
+    dados = coletar_dados_reais()
+    _cache["dados"] = dados
+    _cache["timestamp"] = agora
+    return dados
