@@ -67,7 +67,7 @@ def carregar_dados() -> pd.DataFrame:
     """Fonte de dados (simulada). Substituir pela ingestão real das APIs das redes."""
     dados_musica = {
         "Artista": [
-            "Anitta", "Anitta", "Alok", "Caetano Veloso", "Matuê", "Alok", "Matuê",
+            "CATWEN", "CATWEN", "Dua Lipa", "Zara Larsson",
         ],
         "Faixa_ou_Assunto": [
             "Novo Single", "Show de Ontem", "Remix Eletrônico", "Turnê de Despedida",
