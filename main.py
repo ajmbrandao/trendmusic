@@ -63,22 +63,39 @@ class TendenciaArtista(BaseModel):
 # Funções de domínio (separadas para serem testáveis isoladamente)
 # ---------------------------------------------------------------------------
 
+# Colunas obrigatórias em cada registo (usado para validação)
+COLUNAS_OBRIGATORIAS = [
+    "Artista", "Faixa_ou_Assunto", "Mencoes",
+    "Compartilhamentos", "Salves_Favoritos", "Horas_Desde_Lancamento",
+]
+
+
 def carregar_dados() -> pd.DataFrame:
-    """Fonte de dados (simulada). Substituir pela ingestão real das APIs das redes."""
-    dados_musica = {
-        "Artista": [
-            "CATWEN", "CATWEN", "Dua Lipa", "Zara Larsson",
-        ],
-        "Faixa_ou_Assunto": [
-            "Novo Single", "Show de Ontem", "Remix Eletrônico", "Turnê de Despedida",
-            "Álbum Novo", "Podcast Track", "Prévia no TikTok",
-        ],
-        "Mencoes": [1500, 800, 450, 2100, 5000, 200, 3500],
-        "Compartilhamentos": [900, 150, 80, 1200, 4100, 30, 2800],
-        "Salves_Favoritos": [600, 90, 110, 850, 3200, 15, 1900],
-        "Horas_Desde_Lancamento": [3, 12, 5, 24, 2, 48, 1],
-    }
-    return pd.DataFrame(dados_musica)
+    """Fonte de dados (simulada). Substituir pela ingestão real das APIs das redes.
+
+    Estrutura como UMA LISTA COM UM DICIONÁRIO POR FAIXA. Cada registo é
+    autocontido, por isso é impossível "desalinhar colunas" (era o que
+    provocava o erro 'All arrays must be of the same length'): para adicionar
+    ou remover uma faixa, mexe-se num bloco só.
+    """
+    dados_musica = [
+        {"Artista": "CATWEN",       "Faixa_ou_Assunto": "Single de Estreia",     "Mencoes": 4500, "Compartilhamentos": 3800, "Salves_Favoritos": 2900, "Horas_Desde_Lancamento": 2},
+        {"Artista": "CATWEN",       "Faixa_ou_Assunto": "Performance Viral",     "Mencoes": 3200, "Compartilhamentos": 2600, "Salves_Favoritos": 1800, "Horas_Desde_Lancamento": 4},
+        {"Artista": "Dua Lipa",     "Faixa_ou_Assunto": "Novo Single",           "Mencoes": 3000, "Compartilhamentos": 2000, "Salves_Favoritos": 1500, "Horas_Desde_Lancamento": 6},
+        {"Artista": "Dua Lipa",     "Faixa_ou_Assunto": "Remix Internacional",   "Mencoes": 1200, "Compartilhamentos": 500,  "Salves_Favoritos": 400,  "Horas_Desde_Lancamento": 18},
+        {"Artista": "Zara Larsson", "Faixa_ou_Assunto": "Faixa de Catálogo",     "Mencoes": 900,  "Compartilhamentos": 400,  "Salves_Favoritos": 300,  "Horas_Desde_Lancamento": 30},
+        {"Artista": "Zara Larsson", "Faixa_ou_Assunto": "Resgate de Hit Antigo", "Mencoes": 800,  "Compartilhamentos": 200,  "Salves_Favoritos": 250,  "Horas_Desde_Lancamento": 36},
+    ]
+
+    df = pd.DataFrame(dados_musica)
+
+    # Validação defensiva: se algum registo não trouxer todas as colunas,
+    # falha com uma mensagem clara em vez de um erro críptico do pandas.
+    em_falta = [c for c in COLUNAS_OBRIGATORIAS if c not in df.columns]
+    if em_falta:
+        raise ValueError(f"Faltam colunas nos dados: {em_falta}")
+
+    return df
 
 
 def truncar_score(valor: float, casas_decimais: int = 2) -> float:
